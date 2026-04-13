@@ -78,6 +78,17 @@ We’ve benchmarked our visual approximations securely against field expectation
 * **CNN Analyst Proxy:** 77.2% overall precision on standard classes—highly suitable as a rapid initial field screening tool for junior geologists and robotic exploration rovers.
 * **LiDAR Geometry:** Models pure 2D physical variation with approx ~55% analogous correlation to TLS point clouds.
 
+## 🤖 Autonomous Parts & Outputs
+
+Speleo-X integration onto autonomous rovers empowers real-time mineral classification and navigation. 
+
+<div align="center">
+  <img src="test_img/speleo-x.png" width="45%" style="margin-right: 5%;" alt="Autonomous Speleo-X System"/>
+  <img src="test_img/speleo-x1.jpg" width="45%" alt="Speleo-X Rover Integration"/>
+</div>
+
+<br/>
+
 ## 🤝 Contribution & License
 
 Speleo-X is designed as a foundational stepping stone for fully autonomous **Cave Bots** and **Agricultural Rovers**. 
