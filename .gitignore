@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.h5
+dataset/
+outputs/*
+!outputs/out_quartz.png
+.vscode/
+
+# Ignore virtual environments
+venv/
+env/
+.venv/
