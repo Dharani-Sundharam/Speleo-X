@@ -3,7 +3,7 @@
   <img src="https://raw.githubusercontent.com/tandpfun/skill-icons/main/icons/TensorFlow-Dark.svg" height="80"/>
   <img src="https://raw.githubusercontent.com/tandpfun/skill-icons/main/icons/Python-Dark.svg" height="80"/>
 
-  # 🦇 Speleo-X
+  # Speleo-X
   **Subterranean Sensing & Geological Digital Twin Engine**
   
   ![Version](https://img.shields.io/badge/version-2.0.0--%CE%B1-blue?style=for-the-badge)
