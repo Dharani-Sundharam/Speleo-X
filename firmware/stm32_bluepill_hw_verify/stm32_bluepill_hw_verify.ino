@@ -1,404 +1,297 @@
 /**
- * Speleo-X — STM32F103C8 Blue Pill Chassis Integration Test
- * ============================================================
+ * Speleo-X — STM32F103C8 Blue Pill  ROS Serial Bridge
+ * =====================================================
  *
- * Exercises dual DRV8833 motor drivers, MPU6050 IMU, and dual quadrature
- * wheel encoders in a repeatable, non-blocking motion sequence while
- * streaming 100 ms telemetry over Serial.
+ * Upgraded from hw_verify test sketch to a full ROS 2 serial bridge.
+ * The Raspberry Pi controls the motors and receives sensor data over
+ * USART1 (PA9/PA10) at 115200 baud.
  *
- * Pin map (exact wiring):
- *   Left  motor driver (Board 1) : PB8 = Forward, PB9 = Reverse
- *   Right motor driver (Board 2) : PB0 = Forward, PB1 = Reverse
- *   Left  encoder                : PA0 = Channel A, PA1 = Channel B
- *   Right encoder                : PA6 = Channel A, PA7 = Channel B
+ * ── Serial Protocol ──────────────────────────────────────────────────────────
+ *
+ *   IN  (Pi → STM32):
+ *     "m,<left_pwm>,<right_pwm>\n"
+ *       left_pwm, right_pwm : signed integer, range −255 … +255
+ *       Positive = forward,  Negative = reverse,  0 = stop
+ *     Example: "m,200,200\n"  → both motors forward at ~78% power
+ *
+ *   OUT (STM32 → Pi):   published at 20 Hz (every 50 ms)
+ *     "T=<ms> ENC_L=<ticks> ENC_R=<ticks> AX=<raw> AY=<raw> AZ=<raw> GX=<raw> GY=<raw> GZ=<raw>"
+ *       ENC_L / ENC_R : cumulative encoder ticks (signed long)
+ *       AX/AY/AZ      : MPU6050 raw accelerometer (±2 g full-scale → LSB = 16384/g)
+ *       GX/GY/GZ      : MPU6050 raw gyroscope     (±250 °/s full-scale → LSB = 131/(°/s))
+ *
+ *   Comment lines start with '#' and are safe to ignore on the Pi side.
+ *
+ * ── Pin map ──────────────────────────────────────────────────────────────────
+ *   Left  motor driver (Board 1) : PB8 = IN1 (FWD PWM), PB9  = IN2 (REV PWM)
+ *   Right motor driver (Board 2) : PB0 = IN1 (FWD PWM), PB10 = IN2 (REV PWM)
+ *                                  (PB1 was hardware-stuck HIGH — moved to PB10)
+ *   Left  encoder                : PA0 = Channel A (EXTI), PA1 = Channel B
+ *   Right encoder                : PA2 = Channel A (EXTI), PA3 = Channel B
  *   I2C / MPU6050                : PB6 = SCL, PB7 = SDA  (address 0x68)
  *   Serial telemetry             : USART1 PA9 (TX) / PA10 (RX) @ 115200
  *
- * Motion test cycle (repeats forever):
- *   1. Forward  2.0 s
- *   2. Stop     1.0 s  (all motor pins LOW)
- *   3. Reverse  2.0 s
- *   4. Stop     1.0 s
- *   5. Turn L   1.5 s  (left reverse, right forward)
- *   6. Stop     1.0 s
- *   7. Turn R   1.5 s  (left forward, right reverse)
- *   8. Stop     3.0 s
+ * ── Build notes (Arduino IDE + stm32duino) ───────────────────────────────────
+ *   Board            : Generic STM32F1 series
+ *   Board part number: BluePill F103C8
+ *   U(S)ART support  : Enabled (generic 'Serial')
+ *   Upload method    : STM32CubeProgrammer (SWD) or STLink
  *
- * Build notes (Arduino IDE / PlatformIO + stm32duino):
- *   - Board   : Generic STM32F103C8
- *   - USB     : None (use external USB-UART on PA9/PA10)
- *   - U(S)ART : Enabled (maps Serial to USART1)
- *
- * PlatformIO example env (platformio.ini):
+ * ── PlatformIO env ───────────────────────────────────────────────────────────
  *   [env:bluepill_f103c8]
- *   platform  = ststm32
- *   board     = bluepill_f103c8
- *   framework = arduino
- *   upload_protocol = stlink
+ *   platform         = ststm32
+ *   board            = bluepill_f103c8
+ *   framework        = arduino
+ *   upload_protocol  = stlink
  */
 
 #include <Wire.h>
 
-// ---------------------------------------------------------------------------
-// Motor control pins — DRV8833 IN1/IN2 per channel
-// ---------------------------------------------------------------------------
-static const uint8_t LEFT_MOTOR_FWD  = PB8;
-static const uint8_t LEFT_MOTOR_REV  = PB9;
-static const uint8_t RIGHT_MOTOR_FWD = PB0;
-static const uint8_t RIGHT_MOTOR_REV = PB1;
+// ── Motor control pins (DRV8833 IN1/IN2, both PWM-capable timer pins) ────────
+static const uint8_t LEFT_MOTOR_FWD  = PB8;   // TIM4_CH3
+static const uint8_t LEFT_MOTOR_REV  = PB9;   // TIM4_CH4
+static const uint8_t RIGHT_MOTOR_FWD = PB0;   // TIM3_CH3
+static const uint8_t RIGHT_MOTOR_REV = PB10;  // TIM2_CH3  (PB1 was stuck HIGH)
 
-// ---------------------------------------------------------------------------
-// Quadrature encoder pins
-// ---------------------------------------------------------------------------
-static const uint8_t LEFT_ENCODER_A  = PA0;
+// ── Quadrature encoder pins ───────────────────────────────────────────────────
+static const uint8_t LEFT_ENCODER_A  = PA0;   // EXTI0
 static const uint8_t LEFT_ENCODER_B  = PA1;
-static const uint8_t RIGHT_ENCODER_A = PA6;
-static const uint8_t RIGHT_ENCODER_B = PA7;
+static const uint8_t RIGHT_ENCODER_A = PA2;   // EXTI2 — no I2C conflict
+static const uint8_t RIGHT_ENCODER_B = PA3;
 
-// ---------------------------------------------------------------------------
-// I2C / MPU6050 register map
-// ---------------------------------------------------------------------------
-static const uint8_t I2C_SCL_PIN       = PB6;
-static const uint8_t I2C_SDA_PIN       = PB7;
-static const uint8_t MPU6050_I2C_ADDR  = 0x68;
-static const uint8_t MPU6050_REG_PWR   = 0x6B;  // Power management 1
-static const uint8_t MPU6050_REG_ACCEL = 0x3B;  // ACCEL_XOUT_H (6 bytes)
+// ── MPU6050 I2C register map ──────────────────────────────────────────────────
+static const uint8_t I2C_SCL_PIN        = PB6;
+static const uint8_t I2C_SDA_PIN        = PB7;
+static const uint8_t MPU6050_ADDR       = 0x68;
+static const uint8_t MPU6050_REG_PWR    = 0x6B;  // Power management 1
+static const uint8_t MPU6050_REG_ACCEL  = 0x3B;  // ACCEL_XOUT_H (6 bytes)
+static const uint8_t MPU6050_REG_GYRO   = 0x43;  // GYRO_XOUT_H  (6 bytes)
 
-// ---------------------------------------------------------------------------
-// Timing constants (milliseconds)
-// ---------------------------------------------------------------------------
-static const uint32_t TELEMETRY_INTERVAL_MS = 100;
-static const uint32_t DURATION_FORWARD_MS     = 2000;
-static const uint32_t DURATION_REVERSE_MS     = 2000;
-static const uint32_t DURATION_TURN_MS        = 1500;
-static const uint32_t DURATION_STOP_MS        = 1000;
-static const uint32_t DURATION_STOP_LONG_MS   = 3000;
+// ── Timing ────────────────────────────────────────────────────────────────────
+static const uint32_t TELEMETRY_INTERVAL_MS = 50;    // 20 Hz output
+static const uint32_t WATCHDOG_TIMEOUT_MS   = 1000;  // stop if Pi silent > 1 s
 
-// ---------------------------------------------------------------------------
-// Encoder tick counters — updated only inside ISRs; read under interrupt mask
-// ---------------------------------------------------------------------------
+// ── Encoder tick counters — volatile, read under interrupt mask ───────────────
 volatile long left_encoder_ticks  = 0;
 volatile long right_encoder_ticks = 0;
 
-// ---------------------------------------------------------------------------
-// Motion state machine
-// ---------------------------------------------------------------------------
-enum MotionPhase : uint8_t {
-  PHASE_FORWARD,
-  PHASE_STOP_AFTER_FORWARD,
-  PHASE_REVERSE,
-  PHASE_STOP_AFTER_REVERSE,
-  PHASE_TURN_LEFT,
-  PHASE_STOP_AFTER_TURN_LEFT,
-  PHASE_TURN_RIGHT,
-  PHASE_STOP_AFTER_TURN_RIGHT,
-};
+// ── Motor state (for watchdog comparison) ────────────────────────────────────
+static int current_left_pwm  = 0;
+static int current_right_pwm = 0;
 
-static MotionPhase current_phase      = PHASE_FORWARD;
-static uint32_t    phase_start_ms     = 0;
-static uint32_t    last_telemetry_ms  = 0;
-static uint32_t    cycle_count        = 0;
+// ── Timestamps ────────────────────────────────────────────────────────────────
+static uint32_t last_telemetry_ms = 0;
+static uint32_t last_command_ms   = 0;
 
-// ---------------------------------------------------------------------------
-// Lightweight quadrature ISRs — Pin A CHANGE, direction from Pin B
-// ---------------------------------------------------------------------------
+// ── Serial input buffer ───────────────────────────────────────────────────────
+static String serial_buffer = "";
+
+// =============================================================================
+// Quadrature encoder ISRs
+// =============================================================================
 void leftEncoderISR() {
-  if (digitalRead(LEFT_ENCODER_A) == digitalRead(LEFT_ENCODER_B)) {
+  if (digitalRead(LEFT_ENCODER_A) == digitalRead(LEFT_ENCODER_B))
     left_encoder_ticks++;
-  } else {
+  else
     left_encoder_ticks--;
-  }
 }
 
 void rightEncoderISR() {
-  if (digitalRead(RIGHT_ENCODER_A) == digitalRead(RIGHT_ENCODER_B)) {
+  if (digitalRead(RIGHT_ENCODER_A) == digitalRead(RIGHT_ENCODER_B))
     right_encoder_ticks++;
-  } else {
+  else
     right_encoder_ticks--;
+}
+
+// =============================================================================
+// Motor control — signed PWM  (−255 … +255)
+// Right motor is mounted mirrored: positive PWM → REV pin drives it forward.
+// =============================================================================
+static void setMotors(int left, int right) {
+  left  = constrain(left,  -255, 255);
+  right = constrain(right, -255, 255);
+  current_left_pwm  = left;
+  current_right_pwm = right;
+
+  // Left motor
+  if (left > 0) {
+    analogWrite(LEFT_MOTOR_FWD, left);
+    analogWrite(LEFT_MOTOR_REV, 0);
+  } else if (left < 0) {
+    analogWrite(LEFT_MOTOR_FWD, 0);
+    analogWrite(LEFT_MOTOR_REV, -left);
+  } else {
+    analogWrite(LEFT_MOTOR_FWD, 0);
+    analogWrite(LEFT_MOTOR_REV, 0);
+  }
+
+  // Right motor — physically mirrored, so FWD/REV signals are swapped.
+  if (right > 0) {
+    analogWrite(RIGHT_MOTOR_FWD, 0);
+    analogWrite(RIGHT_MOTOR_REV, right);
+  } else if (right < 0) {
+    analogWrite(RIGHT_MOTOR_FWD, -right);
+    analogWrite(RIGHT_MOTOR_REV, 0);
+  } else {
+    analogWrite(RIGHT_MOTOR_FWD, 0);
+    analogWrite(RIGHT_MOTOR_REV, 0);
   }
 }
 
-// ---------------------------------------------------------------------------
-// Motor helpers
-// ---------------------------------------------------------------------------
-static void stopAllMotors() {
-  digitalWrite(LEFT_MOTOR_FWD,  LOW);
-  digitalWrite(LEFT_MOTOR_REV,  LOW);
-  digitalWrite(RIGHT_MOTOR_FWD, LOW);
-  digitalWrite(RIGHT_MOTOR_REV, LOW);
-}
-
-static void driveForward() {
-  digitalWrite(LEFT_MOTOR_FWD,  HIGH);
-  digitalWrite(LEFT_MOTOR_REV,  LOW);
-  digitalWrite(RIGHT_MOTOR_FWD, HIGH);
-  digitalWrite(RIGHT_MOTOR_REV, LOW);
-}
-
-static void driveReverse() {
-  digitalWrite(LEFT_MOTOR_FWD,  LOW);
-  digitalWrite(LEFT_MOTOR_REV,  HIGH);
-  digitalWrite(RIGHT_MOTOR_FWD, LOW);
-  digitalWrite(RIGHT_MOTOR_REV, HIGH);
-}
-
-static void turnLeftOnDime() {
-  digitalWrite(LEFT_MOTOR_FWD,  LOW);
-  digitalWrite(LEFT_MOTOR_REV,  HIGH);
-  digitalWrite(RIGHT_MOTOR_FWD, HIGH);
-  digitalWrite(RIGHT_MOTOR_REV, LOW);
-}
-
-static void turnRightOnDime() {
-  digitalWrite(LEFT_MOTOR_FWD,  HIGH);
-  digitalWrite(LEFT_MOTOR_REV,  LOW);
-  digitalWrite(RIGHT_MOTOR_FWD, LOW);
-  digitalWrite(RIGHT_MOTOR_REV, HIGH);
-}
-
-// ---------------------------------------------------------------------------
-// MPU6050 — native Wire transactions (no third-party IMU library)
-// ---------------------------------------------------------------------------
-static bool mpu6050WriteRegister(uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(MPU6050_I2C_ADDR);
+// =============================================================================
+// MPU6050 helpers
+// =============================================================================
+static bool mpu6050WriteReg(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU6050_ADDR);
   Wire.write(reg);
   Wire.write(value);
   return Wire.endTransmission() == 0;
 }
 
-static bool mpu6050ReadAccelerometerRaw(int16_t& ax, int16_t& ay, int16_t& az) {
-  Wire.beginTransmission(MPU6050_I2C_ADDR);
-  Wire.write(MPU6050_REG_ACCEL);
-  if (Wire.endTransmission(false) != 0) {
-    return false;
-  }
+// Read 3 consecutive 16-bit big-endian signed registers starting at 'reg'.
+static bool mpu6050Read6(uint8_t reg, int16_t &a, int16_t &b, int16_t &c) {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(static_cast<int>(MPU6050_ADDR), 6) != 6) return false;
 
-  if (Wire.requestFrom(static_cast<int>(MPU6050_I2C_ADDR), 6) != 6) {
-    return false;
-  }
+  const uint8_t ah = Wire.read(), al = Wire.read();
+  const uint8_t bh = Wire.read(), bl = Wire.read();
+  const uint8_t ch = Wire.read(), cl = Wire.read();
 
-  const uint8_t xh = Wire.read();
-  const uint8_t xl = Wire.read();
-  const uint8_t yh = Wire.read();
-  const uint8_t yl = Wire.read();
-  const uint8_t zh = Wire.read();
-  const uint8_t zl = Wire.read();
-
-  ax = static_cast<int16_t>((xh << 8) | xl);
-  ay = static_cast<int16_t>((yh << 8) | yl);
-  az = static_cast<int16_t>((zh << 8) | zl);
+  a = static_cast<int16_t>((ah << 8) | al);
+  b = static_cast<int16_t>((bh << 8) | bl);
+  c = static_cast<int16_t>((ch << 8) | cl);
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Telemetry — encoder snapshot uses interrupt masking for atomic 32-bit reads
-// ---------------------------------------------------------------------------
-static const __FlashStringHelper* phaseLabel(MotionPhase phase) {
-  switch (phase) {
-    case PHASE_FORWARD:               return F("FORWARD");
-    case PHASE_STOP_AFTER_FORWARD:    return F("STOP");
-    case PHASE_REVERSE:               return F("REVERSE");
-    case PHASE_STOP_AFTER_REVERSE:    return F("STOP");
-    case PHASE_TURN_LEFT:             return F("TURN_LEFT");
-    case PHASE_STOP_AFTER_TURN_LEFT:  return F("STOP");
-    case PHASE_TURN_RIGHT:            return F("TURN_RIGHT");
-    case PHASE_STOP_AFTER_TURN_RIGHT: return F("STOP");
-    default:                          return F("UNKNOWN");
+// =============================================================================
+// Serial command parser — expects "m,<left>,<right>\n"
+// =============================================================================
+static void parseCommand(const String &line) {
+  if (!line.startsWith(F("m,"))) return;
+
+  const int c1 = line.indexOf(',');
+  const int c2 = line.indexOf(',', c1 + 1);
+  if (c1 < 0 || c2 < 0) {
+    Serial.println(F("# ERR: bad format, expected m,<left>,<right>"));
+    return;
   }
+
+  const int left_pwm  = line.substring(c1 + 1, c2).toInt();
+  const int right_pwm = line.substring(c2 + 1).toInt();
+
+  setMotors(left_pwm, right_pwm);
+  last_command_ms = millis();
 }
 
+// =============================================================================
+// Telemetry output — sent at 20 Hz
+// Format: "T=<ms> ENC_L=<ticks> ENC_R=<ticks> AX=.. AY=.. AZ=.. GX=.. GY=.. GZ=.."
+// =============================================================================
 static void printTelemetry() {
-  int16_t accel_x = 0;
-  int16_t accel_y = 0;
-  int16_t accel_z = 0;
-  const bool imu_ok = mpu6050ReadAccelerometerRaw(accel_x, accel_y, accel_z);
+  // Read IMU
+  int16_t ax = 0, ay = 0, az = 0;
+  int16_t gx = 0, gy = 0, gz = 0;
+  const bool accel_ok = mpu6050Read6(MPU6050_REG_ACCEL, ax, ay, az);
+  const bool gyro_ok  = mpu6050Read6(MPU6050_REG_GYRO,  gx, gy, gz);
 
-  long encoder_left = 0;
-  long encoder_right = 0;
+  // Atomic snapshot of encoder ticks
+  long enc_l, enc_r;
   noInterrupts();
-  encoder_left  = left_encoder_ticks;
-  encoder_right = right_encoder_ticks;
+  enc_l = left_encoder_ticks;
+  enc_r = right_encoder_ticks;
   interrupts();
 
-  Serial.print(F("cycle="));
-  Serial.print(cycle_count);
-  Serial.print(F(" phase="));
-  Serial.print(phaseLabel(current_phase));
-  Serial.print(F(" t="));
-  Serial.print(millis());
+  // Odometry
+  Serial.print(F("T="));     Serial.print(millis());
+  Serial.print(F(" ENC_L=")); Serial.print(enc_l);
+  Serial.print(F(" ENC_R=")); Serial.print(enc_r);
 
-  if (imu_ok) {
-    Serial.print(F(" ACCEL_X="));
-    Serial.print(accel_x);
-    Serial.print(F(" ACCEL_Y="));
-    Serial.print(accel_y);
-    Serial.print(F(" ACCEL_Z="));
-    Serial.print(accel_z);
-  } else {
-    Serial.print(F(" ACCEL=ERR"));
-  }
+  // Accelerometer (±2g, LSB = 16384 counts/g)
+  Serial.print(F(" AX="));   Serial.print(accel_ok ? ax : 0);
+  Serial.print(F(" AY="));   Serial.print(accel_ok ? ay : 0);
+  Serial.print(F(" AZ="));   Serial.print(accel_ok ? az : 0);
 
-  Serial.print(F(" ENC_L="));
-  Serial.print(encoder_left);
-  Serial.print(F(" ENC_R="));
-  Serial.println(encoder_right);
+  // Gyroscope (±250°/s, LSB = 131 counts per °/s)
+  Serial.print(F(" GX="));   Serial.print(gyro_ok  ? gx : 0);
+  Serial.print(F(" GY="));   Serial.print(gyro_ok  ? gy : 0);
+  Serial.print(F(" GZ="));   Serial.println(gyro_ok ? gz : 0);
 }
 
-// ---------------------------------------------------------------------------
-// Non-blocking motion sequencer
-// ---------------------------------------------------------------------------
-static void beginPhase(MotionPhase next_phase) {
-  current_phase  = next_phase;
-  phase_start_ms = millis();
-
-  switch (next_phase) {
-    case PHASE_FORWARD:
-      driveForward();
-      Serial.println(F(">> MOTION: FORWARD (2.0 s)"));
-      break;
-    case PHASE_STOP_AFTER_FORWARD:
-    case PHASE_STOP_AFTER_REVERSE:
-    case PHASE_STOP_AFTER_TURN_LEFT:
-      stopAllMotors();
-      Serial.println(F(">> MOTION: STOP (1.0 s)"));
-      break;
-    case PHASE_REVERSE:
-      driveReverse();
-      Serial.println(F(">> MOTION: REVERSE (2.0 s)"));
-      break;
-    case PHASE_TURN_LEFT:
-      turnLeftOnDime();
-      Serial.println(F(">> MOTION: TURN LEFT (1.5 s)"));
-      break;
-    case PHASE_TURN_RIGHT:
-      turnRightOnDime();
-      Serial.println(F(">> MOTION: TURN RIGHT (1.5 s)"));
-      break;
-    case PHASE_STOP_AFTER_TURN_RIGHT:
-      stopAllMotors();
-      Serial.println(F(">> MOTION: STOP (3.0 s, end of cycle)"));
-      break;
-    default:
-      stopAllMotors();
-      break;
-  }
-}
-
-static void advanceMotionStateMachine() {
-  const uint32_t elapsed_ms = millis() - phase_start_ms;
-
-  switch (current_phase) {
-    case PHASE_FORWARD:
-      if (elapsed_ms >= DURATION_FORWARD_MS) {
-        beginPhase(PHASE_STOP_AFTER_FORWARD);
-      }
-      break;
-
-    case PHASE_STOP_AFTER_FORWARD:
-      if (elapsed_ms >= DURATION_STOP_MS) {
-        beginPhase(PHASE_REVERSE);
-      }
-      break;
-
-    case PHASE_REVERSE:
-      if (elapsed_ms >= DURATION_REVERSE_MS) {
-        beginPhase(PHASE_STOP_AFTER_REVERSE);
-      }
-      break;
-
-    case PHASE_STOP_AFTER_REVERSE:
-      if (elapsed_ms >= DURATION_STOP_MS) {
-        beginPhase(PHASE_TURN_LEFT);
-      }
-      break;
-
-    case PHASE_TURN_LEFT:
-      if (elapsed_ms >= DURATION_TURN_MS) {
-        beginPhase(PHASE_STOP_AFTER_TURN_LEFT);
-      }
-      break;
-
-    case PHASE_STOP_AFTER_TURN_LEFT:
-      if (elapsed_ms >= DURATION_STOP_MS) {
-        beginPhase(PHASE_TURN_RIGHT);
-      }
-      break;
-
-    case PHASE_TURN_RIGHT:
-      if (elapsed_ms >= DURATION_TURN_MS) {
-        beginPhase(PHASE_STOP_AFTER_TURN_RIGHT);
-      }
-      break;
-
-    case PHASE_STOP_AFTER_TURN_RIGHT:
-      if (elapsed_ms >= DURATION_STOP_LONG_MS) {
-        cycle_count++;
-        beginPhase(PHASE_FORWARD);
-      }
-      break;
-  }
-}
-
-// ---------------------------------------------------------------------------
+// =============================================================================
 // Arduino entry points
-// ---------------------------------------------------------------------------
+// =============================================================================
 void setup() {
   Serial.begin(115200);
-  while (!Serial && millis() < 3000) {
-    // Wait briefly for USB-UART adapter; safe no-op if not connected.
-  }
+  while (!Serial && millis() < 3000) { /* wait for USB-UART */ }
 
-  Serial.println();
-  Serial.println(F("Speleo-X STM32 Blue Pill — Chassis Integration Test"));
-  Serial.println(F("==================================================="));
+  Serial.println(F("# Speleo-X ROS Bridge — STM32F103C8 Blue Pill"));
+  Serial.println(F("# Command : m,<left_pwm>,<right_pwm>  (range -255..+255)"));
+  Serial.println(F("# Telemetry: T ENC_L ENC_R AX AY AZ GX GY GZ  @ 20 Hz"));
 
-  // Motor outputs — chassis must start at full standstill (all LOW).
+  // ── Motor pins
   pinMode(LEFT_MOTOR_FWD,  OUTPUT);
   pinMode(LEFT_MOTOR_REV,  OUTPUT);
   pinMode(RIGHT_MOTOR_FWD, OUTPUT);
   pinMode(RIGHT_MOTOR_REV, OUTPUT);
-  stopAllMotors();
-  Serial.println(F("Motors  : OUTPUT, all pins LOW (standstill)"));
+  setMotors(0, 0);
+  Serial.println(F("# Motors  : ready (all stopped)"));
 
-  // Encoder inputs with internal pull-ups; EXTI on channel A (CHANGE).
+  // ── Encoder pins + interrupts
   pinMode(LEFT_ENCODER_A,  INPUT_PULLUP);
   pinMode(LEFT_ENCODER_B,  INPUT_PULLUP);
   pinMode(RIGHT_ENCODER_A, INPUT_PULLUP);
   pinMode(RIGHT_ENCODER_B, INPUT_PULLUP);
-
   attachInterrupt(digitalPinToInterrupt(LEFT_ENCODER_A),  leftEncoderISR,  CHANGE);
   attachInterrupt(digitalPinToInterrupt(RIGHT_ENCODER_A), rightEncoderISR, CHANGE);
-  Serial.println(F("Encoders: PA0/PA1 (L), PA6/PA7 (R), ISR quadrature on A-edge"));
+  Serial.println(F("# Encoders: PA0/PA1 (L), PA2/PA3 (R)"));
 
-  // I2C bus on PB6/PB7, wake MPU6050 from sleep.
+  // ── I2C / MPU6050
   Wire.setSCL(I2C_SCL_PIN);
   Wire.setSDA(I2C_SDA_PIN);
   Wire.begin();
-  Wire.setClock(100000);
+  Wire.setClock(400000);  // 400 kHz fast mode
 
-  if (mpu6050WriteRegister(MPU6050_REG_PWR, 0x00)) {
-    Serial.println(F("MPU6050 : awake (PWR_MGMT_1 = 0x00)"));
+  if (mpu6050WriteReg(MPU6050_REG_PWR, 0x00)) {
+    Serial.println(F("# MPU6050 : awake — accel + gyro active"));
   } else {
-    Serial.println(F("MPU6050 : I2C wake FAILED — check wiring"));
+    Serial.println(F("# MPU6050 : I2C FAILED — check PB6/PB7 wiring"));
   }
 
-  left_encoder_ticks  = 0;
-  right_encoder_ticks = 0;
-  last_telemetry_ms   = millis();
-  phase_start_ms      = millis();
-  driveForward();
-  Serial.println(F("Sequence: starting FORWARD phase"));
-  Serial.println(F("Telemetry interval: 100 ms"));
-  Serial.println();
+  last_telemetry_ms = millis();
+  last_command_ms   = millis();
+
+  Serial.println(F("# Ready. Waiting for commands..."));
 }
 
 void loop() {
-  const uint32_t now_ms = millis();
+  const uint32_t now = millis();
 
-  if (now_ms - last_telemetry_ms >= TELEMETRY_INTERVAL_MS) {
-    last_telemetry_ms = now_ms;
-    printTelemetry();
+  // ── Read incoming serial (non-blocking, line-buffered)
+  while (Serial.available()) {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\n' || c == '\r') {
+      serial_buffer.trim();
+      if (serial_buffer.length() > 0) {
+        parseCommand(serial_buffer);
+        serial_buffer = "";
+      }
+    } else {
+      serial_buffer += c;
+    }
   }
 
-  advanceMotionStateMachine();
+  // ── Watchdog: stop motors if Pi has gone silent
+  if ((now - last_command_ms > WATCHDOG_TIMEOUT_MS) &&
+      (current_left_pwm != 0 || current_right_pwm != 0)) {
+    setMotors(0, 0);
+    Serial.println(F("# Watchdog: no command for 1s — motors stopped"));
+  }
+
+  // ── Telemetry at 20 Hz
+  if (now - last_telemetry_ms >= TELEMETRY_INTERVAL_MS) {
+    last_telemetry_ms = now;
+    printTelemetry();
+  }
 }
