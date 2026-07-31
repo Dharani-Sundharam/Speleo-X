@@ -98,14 +98,14 @@ m,<left_pwm>,<right_pwm>\n
 | `left_pwm` | `int` | `-255 ... +255` | Left motor power. `+` = forward, `-` = reverse |
 | `right_pwm` | `int` | `-255 ... +255` | Right motor power. `+` = forward, `-` = reverse |
 
-**Examples:**
+**Examples (physically verified):**
 
 | Command | Effect |
 | :--- | :--- |
-| `m,200,200\n` | Both motors forward at ~78% power |
-| `m,-200,-200\n` | Both motors reverse at ~78% power |
-| `m,-200,200\n` | Tank turn left |
-| `m,200,-200\n` | Tank turn right |
+| `m,200,200\n` | Both motors forward — robot moves **FORWARD** |
+| `m,-200,-200\n` | Both motors reverse — robot moves **REVERSE** |
+| `m,-200,200\n` | Left reverse, Right forward — **TURN LEFT** |
+| `m,200,-200\n` | Left forward, Right reverse — **TURN RIGHT** |
 | `m,0,0\n` | Stop all motors |
 
 ---

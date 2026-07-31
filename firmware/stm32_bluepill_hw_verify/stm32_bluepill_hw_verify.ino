@@ -125,13 +125,14 @@ static void setMotors(int left, int right) {
     analogWrite(LEFT_MOTOR_REV, 0);
   }
 
-  // Right motor — physically mirrored, so FWD/REV signals are swapped.
+  // Right motor — positive PWM = forward, negative PWM = reverse.
+  // (Physical mirroring is handled by DRV8833 output wiring, not in software.)
   if (right > 0) {
-    analogWrite(RIGHT_MOTOR_FWD, 0);
-    analogWrite(RIGHT_MOTOR_REV, right);
-  } else if (right < 0) {
-    analogWrite(RIGHT_MOTOR_FWD, -right);
+    analogWrite(RIGHT_MOTOR_FWD, right);
     analogWrite(RIGHT_MOTOR_REV, 0);
+  } else if (right < 0) {
+    analogWrite(RIGHT_MOTOR_FWD, 0);
+    analogWrite(RIGHT_MOTOR_REV, -right);
   } else {
     analogWrite(RIGHT_MOTOR_FWD, 0);
     analogWrite(RIGHT_MOTOR_REV, 0);
