@@ -185,6 +185,8 @@ class SpeleoFoxglove(FoxgloveServerListener):
             self._prev_t     = now
 
             now_ns = int(now * 1e9)  # Foxglove needs nanoseconds
+            qz = math.sin(self._th / 2.0)
+            qw = math.cos(self._th / 2.0)
 
             # ── Queue all messages for the async sender task ───────────────────
             if self._send_queue and self._ch_imu:
