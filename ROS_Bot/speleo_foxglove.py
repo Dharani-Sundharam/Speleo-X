@@ -255,14 +255,22 @@ class SpeleoFoxglove(FoxgloveServerListener):
             print(f"[parse] error on '{line}': {e}")
 
     # =========================================================================
-    # Serial reader thread
+    # Serial reader thread — manual byte buffer to prevent line merging
     # =========================================================================
     def _serial_thread(self):
+        buf = b''
         while True:
             try:
-                raw = self.ser.readline()
-                if raw:
-                    self._parse_line(raw.decode('utf-8', errors='ignore').strip())
+                # Read however many bytes are waiting (at least 1 to block)
+                chunk = self.ser.read(max(1, self.ser.in_waiting))
+                if chunk:
+                    buf += chunk
+                    # Process every complete line in the buffer
+                    while b'\n' in buf:
+                        line_bytes, buf = buf.split(b'\n', 1)
+                        text = line_bytes.decode('utf-8', errors='ignore').strip()
+                        if text:
+                            self._parse_line(text)
             except Exception as e:
                 print(f"[serial] read error: {e}")
                 time.sleep(0.1)
