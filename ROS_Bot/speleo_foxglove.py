@@ -28,10 +28,10 @@ Motor commands received from Foxglove:
 import asyncio
 import json
 import math
+import queue
 import serial
 import threading
 import time
-import struct
 from foxglove_websocket import run_cancellable
 from foxglove_websocket.server import FoxgloveServer, FoxgloveServerListener
 from foxglove_websocket.types import ChannelId
@@ -104,6 +104,8 @@ class SpeleoFoxglove(FoxgloveServerListener):
         self._ch_odom  = None
         self._ch_enc   = None
         self._ch_motor = None
+        # Thread-safe queue: serial thread writes, async sender reads
+        self._send_queue = queue.SimpleQueue()
 
     # =========================================================================
     # FoxgloveServerListener — called when Foxglove publishes back to us
@@ -287,8 +289,7 @@ class SpeleoFoxglove(FoxgloveServerListener):
     # Main async run loop
     # =========================================================================
     async def run(self):
-        # Queue for passing messages from serial thread → async sender
-        self._send_queue = asyncio.Queue(maxsize=200)
+        # _send_queue is already created in __init__ as a thread-safe SimpleQueue
 
         async with FoxgloveServer(
             host="0.0.0.0",
@@ -373,15 +374,20 @@ class SpeleoFoxglove(FoxgloveServerListener):
             print()
             print("Press Ctrl+C to stop.")
 
-            # ── Async sender task: drains the queue and sends to Foxglove ─────
+            # ── Async sender: polls thread-safe queue and sends to Foxglove ──
             async def _sender():
                 while True:
                     try:
-                        ch, ts_ns, data = await self._send_queue.get()
-                        await server.send_message(ch, ts_ns, data)
-                        self._send_queue.task_done()
+                        # Drain all pending messages without blocking
+                        while True:
+                            try:
+                                ch, ts_ns, data = self._send_queue.get_nowait()
+                                await server.send_message(ch, ts_ns, data)
+                            except queue.Empty:
+                                break
                     except Exception as e:
                         print(f"[sender] error: {e}")
+                    await asyncio.sleep(0.005)  # poll at 200Hz
 
             asyncio.create_task(_sender())
 
