@@ -110,8 +110,14 @@ class SpeleoFoxglove(FoxgloveServerListener):
     # =========================================================================
     # FoxgloveServerListener — called when Foxglove publishes back to us
     # =========================================================================
+    def on_client_advertise(self, server, client_id, channel):
+        """Called when Foxglove advertises a channel it wants to publish on."""
+        print(f"[foxglove] Client advertised: topic='{channel.get('topic')}' "
+              f"schema='{channel.get('schemaName')}'")
+
     def on_message_data(self, server, client_id, channel_id, data: bytes):
         """Receive /cmd_vel from Foxglove and drive motors."""
+        print(f"[cmd_vel] raw data: {data[:120]}")   # ← debug: remove once working
         try:
             msg = json.loads(data.decode())
             lx = msg.get("linear",  {}).get("x", 0.0)
@@ -127,8 +133,9 @@ class SpeleoFoxglove(FoxgloveServerListener):
 
             self._send_motor(left_pwm, right_pwm)
             self._last_cmd = time.time()
+            print(f"[cmd_vel] L={left_pwm} R={right_pwm}")
         except Exception as e:
-            print(f"[cmd_vel] parse error: {e}")
+            print(f"[cmd_vel] parse error: {e}  raw={data[:80]}")
 
     # =========================================================================
     # Parse one STM32 telemetry line
