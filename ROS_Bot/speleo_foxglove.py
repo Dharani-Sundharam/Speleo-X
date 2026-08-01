@@ -182,11 +182,10 @@ class SpeleoFoxglove(FoxgloveServerListener):
             self._prev_enc_r = enc_r
             self._prev_t     = now
 
-            qz = math.sin(self._th / 2.0)
-            qw = math.cos(self._th / 2.0)
+            now_ns = int(now * 1e9)  # Foxglove needs nanoseconds
 
-            # ── Publish IMU ───────────────────────────────────────────────────
-            if self._ch_imu and self._server:
+            # ── Queue all messages for the async sender task ───────────────────
+            if self._send_queue and self._ch_imu:
                 imu_msg = json.dumps({
                     "timestamp": stamp,
                     "frame_id":  "base_link",
@@ -194,13 +193,9 @@ class SpeleoFoxglove(FoxgloveServerListener):
                     "angular_velocity":    {"x": gx, "y": gy, "z": gz},
                     "linear_acceleration": {"x": ax, "y": ay, "z": az},
                 }).encode()
-                asyncio.run_coroutine_threadsafe(
-                    self._server.send_message(self._ch_imu, now, imu_msg),
-                    self._loop
-                )
+                self._send_queue.put_nowait((self._ch_imu, now_ns, imu_msg))
 
-            # ── Publish Odometry ──────────────────────────────────────────────
-            if self._ch_odom and self._server:
+            if self._send_queue and self._ch_odom:
                 odom_msg = json.dumps({
                     "timestamp":      stamp,
                     "frame_id":       "odom",
@@ -224,32 +219,21 @@ class SpeleoFoxglove(FoxgloveServerListener):
                                        0,0,0,0,0,0, 0,0,0,0,0,0.05]
                     }
                 }).encode()
-                asyncio.run_coroutine_threadsafe(
-                    self._server.send_message(self._ch_odom, now, odom_msg),
-                    self._loop
-                )
+                self._send_queue.put_nowait((self._ch_odom, now_ns, odom_msg))
 
-            # ── Publish raw encoder ticks ─────────────────────────────────────
-            if self._ch_enc and self._server:
+            if self._send_queue and self._ch_enc:
                 enc_msg = json.dumps({
                     "timestamp": stamp,
                     "data": f"ENC_L={enc_l}  ENC_R={enc_r}"
                 }).encode()
-                asyncio.run_coroutine_threadsafe(
-                    self._server.send_message(self._ch_enc, now, enc_msg),
-                    self._loop
-                )
+                self._send_queue.put_nowait((self._ch_enc, now_ns, enc_msg))
 
-            # ── Publish motor state ───────────────────────────────────────────
-            if self._ch_motor and self._server:
+            if self._send_queue and self._ch_motor:
                 motor_msg = json.dumps({
                     "timestamp": stamp,
                     "data": f"LEFT_PWM={self._left_pwm}  RIGHT_PWM={self._right_pwm}"
                 }).encode()
-                asyncio.run_coroutine_threadsafe(
-                    self._server.send_message(self._ch_motor, now, motor_msg),
-                    self._loop
-                )
+                self._send_queue.put_nowait((self._ch_motor, now_ns, motor_msg))
 
         except Exception as e:
             print(f"[parse] error on '{line}': {e}")
@@ -303,7 +287,8 @@ class SpeleoFoxglove(FoxgloveServerListener):
     # Main async run loop
     # =========================================================================
     async def run(self):
-        self._loop = asyncio.get_event_loop()
+        # Queue for passing messages from serial thread → async sender
+        self._send_queue = asyncio.Queue(maxsize=200)
 
         async with FoxgloveServer(
             host="0.0.0.0",
@@ -377,7 +362,7 @@ class SpeleoFoxglove(FoxgloveServerListener):
             threading.Thread(target=self._watchdog_thread, daemon=True).start()
 
             print("[foxglove] Server running on ws://0.0.0.0:8765")
-            print("[foxglove] Connect Foxglove Studio → Open Connection → Foxglove WebSocket")
+            print("[foxglove] Open Foxglove Studio → Open Connection → Foxglove WebSocket")
             print(f"[foxglove] URL: ws://<YOUR_PI_IP>:8765")
             print()
             print("Channels:")
@@ -387,6 +372,18 @@ class SpeleoFoxglove(FoxgloveServerListener):
             print("  /motor_state  — current PWM values")
             print()
             print("Press Ctrl+C to stop.")
+
+            # ── Async sender task: drains the queue and sends to Foxglove ─────
+            async def _sender():
+                while True:
+                    try:
+                        ch, ts_ns, data = await self._send_queue.get()
+                        await server.send_message(ch, ts_ns, data)
+                        self._send_queue.task_done()
+                    except Exception as e:
+                        print(f"[sender] error: {e}")
+
+            asyncio.create_task(_sender())
 
             # Keep running forever
             while True:
