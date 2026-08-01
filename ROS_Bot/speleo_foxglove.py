@@ -301,8 +301,8 @@ class SpeleoFoxglove(FoxgloveServerListener):
             host="0.0.0.0",
             port=8765,
             name="Speleo-X Bridge",
-            listener=self,
         ) as server:
+            server.set_listener(self)
             self._server = server
 
             # ── Register channels ─────────────────────────────────────────────
