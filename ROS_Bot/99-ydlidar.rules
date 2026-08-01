@@ -1,0 +1,6 @@
+# YDLidar USB Port Binding Rules
+# Top-Left USB Port (ttyUSB0)
+SUBSYSTEM=="tty", ENV{ID_PATH}=="platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.1:1.0", MODE:="0666", SYMLINK+="ydlidar_tilted"
+
+# Top-Right USB Port (ttyUSB1)
+SUBSYSTEM=="tty", ENV{ID_PATH}=="platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.2:1.0", MODE:="0666", SYMLINK+="ydlidar_base"

@@ -1,0 +1,38 @@
+rtabmap:
+  ros__parameters:
+
+    # ── Frame IDs ──────────────────────────────────────────────────────
+    frame_id:       base_link
+    odom_frame_id:  odom
+    map_frame_id:   map
+
+    # ── Input topics ───────────────────────────────────────────────────
+    subscribe_scan:       true   # flat 2D LiDAR for loop closure
+    subscribe_scan_cloud: true   # tilted LiDAR assembled cloud for 3D map
+
+    # ── Sensor mode: LiDAR only (no camera) ───────────────────────────
+    Mem/IncrementalMemory:    "true"
+    Mem/InitWMWithAllNodes:   "false"
+
+    # ── Loop closure ───────────────────────────────────────────────────
+    # Use ICP (point cloud matching) for loop closure with our LiDAR
+    Reg/Strategy:             "1"     # 1 = ICP
+    Icp/PointToPlane:         "false" # 2D scans have no surface normals
+    Icp/Iterations:           "30"
+    Icp/MaxCorrespondenceDistance: "0.1"  # 10cm matching radius
+
+    # ── 2D occupancy grid (replaces slam_toolbox /map) ─────────────────
+    Grid/Sensor:              "0"     # 0 = use /scan (flat LiDAR)
+    Grid/RangeMax:            "8.0"
+    Grid/CellSize:            "0.05"  # 5cm resolution grid
+
+    # ── 3D cloud map (replaces laser_stitcher /cloud_stitched) ─────────
+    cloud_voxel_size:         0.05    # 5cm voxels in 3D map
+
+    # ── Memory / performance tuning for 4GB Pi 4 ───────────────────────
+    Mem/STMSize:              "30"    # short-term memory nodes (reduce RAM)
+    Rtabmap/DetectionRate:    "1"     # process 1 keyframe per second
+    Rtabmap/TimeThr:          "700"   # max processing time per frame (ms)
+
+    # ── Database (save on shutdown, load on restart) ───────────────────
+    database_path: "/home/dharani/cave_map.db"

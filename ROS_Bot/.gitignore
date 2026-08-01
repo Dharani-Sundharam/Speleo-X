@@ -1,0 +1,40 @@
+# ── YOLO / ML model weights ───────────────────────────────────────────────────
+*.pt
+*.pth
+*.onnx
+*.weights
+*.h5
+*.tflite
+
+# ── JPEG / image files (jps = JPEG Stereo, jpg/jpeg = standard images) ────────
+*.jps
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+*.tif
+*.webp
+
+# ── Text files ────────────────────────────────────────────────────────────────
+*.txt
+
+# ── YOLO training runs output ─────────────────────────────────────────────────
+runs/
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+
+# ── ROS logs & build artifacts ────────────────────────────────────────────────
+log/
+build/
+install/
+*.bag
+*.db3
+
+# ── OS / editor clutter ───────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
