@@ -81,8 +81,22 @@ class SpeleoFoxglove(FoxgloveServerListener):
         self._lock      = threading.Lock()
 
         # ── Serial ───────────────────────────────────────────────────────────
-        self.ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=0.1)
-        print(f"[serial] Opened {SERIAL_PORT} @ {BAUD_RATE}")
+        import os
+        ports_to_try = [SERIAL_PORT, '/dev/ttyUSB0', '/dev/ttyUSB1', '/dev/ttyACM0']
+        
+        for port in ports_to_try:
+            if os.path.exists(port):
+                try:
+                    self.ser = serial.Serial(port, BAUD_RATE, timeout=0.1)
+                    print(f"[serial] Opened {port} @ {BAUD_RATE}")
+                    break
+                except serial.SerialException as e:
+                    print(f"[serial] Found {port} but got permission error: {e}")
+                    print(f"         Try running: sudo usermod -aG dialout $USER")
+                    print(f"         Then LOG OUT and LOG BACK IN.")
+                    raise
+        else:
+            raise FileNotFoundError(f"Could not find any serial ports! Checked: {ports_to_try}")
 
         # ── Foxglove server & channels (set in run()) ─────────────────────────
         self._server   = None
