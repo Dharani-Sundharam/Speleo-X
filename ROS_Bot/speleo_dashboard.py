@@ -59,8 +59,8 @@ LIDAR_SCAN_SIZE  = 280     # "Single Fixed Size: 280" from SDK output
 LIDAR_ANGLE_OFFSET_DEG = 180.0  # rotate LiDAR frame to match robot forward direction
                                   # (0=no rotation; adjust if obstacles appear backwards)
 
-MAP_SIZE_PIXELS  = 512
-MAP_SIZE_METERS  = 25.0
+MAP_SIZE_PIXELS  = 256
+MAP_SIZE_METERS  = 25.0    # 25m × 25m coverage, ~9.8cm/px at 256px
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -405,45 +405,33 @@ def lidar_reader():
 
 
 # =============================================================================
-# Broadcaster  — telemetry @20Hz, lidar @10Hz, SLAM map @1Hz
+# Broadcaster  — telemetry @20Hz, lidar @10Hz, SLAM map @0.2Hz (every 5s)
 # =============================================================================
 
+async def _broadcast(msg_str: str):
+    """Send a message to all clients; yield between each send to keep loop responsive."""
+    async with _clients_lock:
+        dead = set()
+        for ws in _clients:
+            try:
+                await ws.send_str(msg_str)
+                await asyncio.sleep(0)   # yield to event loop → motor cmds get through
+            except:
+                dead.add(ws)
+        _clients -= dead
+
+
 async def broadcaster(app):
-    global _clients
     tick = 0
     while True:
-        await asyncio.sleep(0.05)   # 20Hz base
+        await asyncio.sleep(0.05)   # 20 Hz base clock
         tick += 1
 
-        # ── Telemetry ──────────────────────────────────────────────────────
+        # ── Telemetry (every tick = 20 Hz) ────────────────────────────────────
         if _telemetry:
             msg = json.dumps({"type": "telemetry", **_telemetry,
                               "serial": _serial_status,
                               "lidar":  _lidar_status})
-            async with _clients_lock:
-                dead = set()
-                for ws in _clients:
-                    try:    await ws.send_str(msg)
-                    except: dead.add(ws)
-                _clients -= dead
-
-        # ── LiDAR scan points ──────────────────────────────────────────────
-        latest_scan = None
-        while True:
-            try:    latest_scan = _lidar_queue.get_nowait()
-            except queue.Empty: break
-        if latest_scan is not None:
-            lmsg = json.dumps({"type": "lidar",
-                               "points": latest_scan,
-                               "rx": round(_x, 4),
-                               "ry": round(_y, 4),
-                               "rth": round(math.degrees(_th), 2),
-                               "angle_offset": LIDAR_ANGLE_OFFSET_DEG})
-            async with _clients_lock:
-                dead = set()
-                for ws in _clients:
-                    try:    await ws.send_str(lmsg)
-                    except: dead.add(ws)
                 _clients -= dead
 
         # ── SLAM map (every ~2s = 40 ticks) ───────────────────────────────
@@ -463,19 +451,16 @@ async def broadcaster(app):
 
 
 # =============================================================================
-# WebSocket handler
+# /ws/cmd  — dedicated motor command channel (no telemetry, zero contention)
 # =============================================================================
 
-async def ws_handler(request):
-    global _clients, _x, _y, _th, _vx
-    global _prev_enc_l, _prev_enc_r, _prev_t, _last_slam_odom
-
-    ws = web.WebSocketResponse()
+async def ws_cmd_handler(request):
+    """High-priority WebSocket for motor commands only.
+    Nothing is ever sent back on this channel — no telemetry, no lidar,
+    no lock waits from the broadcaster. Latency is as low as WiFi allows."""
+    ws = web.WebSocketResponse(heartbeat=2.0)
     await ws.prepare(request)
-    async with _clients_lock:
-        _clients.add(ws)
-    print(f"[ws] {request.remote} connected  ({len(_clients)} clients)")
-
+    print(f"[cmd] {request.remote} connected")
     try:
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
@@ -488,20 +473,47 @@ async def ws_handler(request):
                         send_motor(l, r)
                     elif t == "stop":
                         send_motor(0, 0)
-                    elif t == "reset_odom":
+                except Exception:
+                    pass
+    finally:
+        print(f"[cmd] {request.remote} disconnected")
+    return ws
+
+
+# =============================================================================
+# /ws  — data channel: telemetry, lidar, SLAM + non-motor commands
+# =============================================================================
+
+async def ws_data_handler(request):
+    global _clients, _x, _y, _th, _vx
+    global _prev_enc_l, _prev_enc_r, _prev_t, _last_slam_odom
+
+    ws = web.WebSocketResponse(heartbeat=5.0)
+    await ws.prepare(request)
+    async with _clients_lock:
+        _clients.add(ws)
+    print(f"[data] {request.remote} connected  ({len(_clients)} clients)")
+
+    try:
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    d = json.loads(msg.data)
+                    t = d.get("type")
+                    if t == "reset_odom":
                         _x = _y = _th = _vx = 0.0
                         _prev_enc_l = _prev_enc_r = _prev_t = None
                         _last_slam_odom = None
                         print("[odom] Reset to origin")
                     elif t == "clear_map":
                         await ws.send_str(json.dumps({"type": "clear_map"}))
-                        print("[map] Clear requested by client")
+                        print("[map] Clear requested")
                 except Exception as e:
-                    print(f"[ws] msg error: {e}")
+                    print(f"[data] msg error: {e}")
     finally:
         async with _clients_lock:
             _clients.discard(ws)
-        print(f"[ws] {request.remote} disconnected")
+        print(f"[data] {request.remote} disconnected")
     return ws
 
 
@@ -807,7 +819,7 @@ input[type=range]::-webkit-slider-thumb {
         <button class="map-btn" id="map-zoom-out" title="Zoom out">−</button>
         <button class="map-btn" id="map-center"   title="Center on robot">⊙</button>
       </div>
-      <div id="map-scale-label" id="map-scale-lbl">— m/div</div>
+      <div id="map-scale-label">— m/div</div>
     </div>
 
   </div>
@@ -868,17 +880,38 @@ let mapScale  = MAP_SCALE_PX; // current zoom
 let panX = 0, panY = 0;       // manual pan offset from robot-centric center
 let slamAvail = false;
 
-// ── WebSocket ─────────────────────────────────────────────────────────────────
-let ws, reconnTimer;
+// ── Dual WebSocket channels ───────────────────────────────────────────────────
+// ws_cmd  → /ws/cmd   motor commands ONLY, nothing sent back, minimal latency
+// ws_data → /ws       telemetry + lidar + slam receive, + slow control msgs
+let ws_cmd, ws_data;
 
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onopen  = () => { setWsBadge(true); clearTimeout(reconnTimer); };
-  ws.onclose = ws.onerror = () => { setWsBadge(false); reconnTimer = setTimeout(connect, 2000); };
-  ws.onmessage = e => handle(JSON.parse(e.data));
+  const base  = `${proto}://${location.host}`;
+
+  // ── Command channel ─────────────────────────────────────────────
+  ws_cmd = new WebSocket(`${base}/ws/cmd`);
+  ws_cmd.onopen  = () => setBadge('badge-ws', true);
+  ws_cmd.onclose = ws_cmd.onerror = () => {
+    setBadge('badge-ws', false);
+    setTimeout(connect, 1000);   // fast reconnect on cmd channel
+  };
+  // No onmessage — this channel only ever sends, never receives
+
+  // ── Data channel ────────────────────────────────────────────────
+  ws_data = new WebSocket(`${base}/ws`);
+  ws_data.onmessage = e => handle(JSON.parse(e.data));
+  ws_data.onclose = ws_data.onerror = () => setTimeout(connect, 2000);
 }
-function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
+
+// Send motor command on dedicated command channel
+function cmdSend(obj) {
+  if (ws_cmd && ws_cmd.readyState === 1) ws_cmd.send(JSON.stringify(obj));
+}
+// Send control command on data channel
+function send(obj) {
+  if (ws_data && ws_data.readyState === 1) ws_data.send(JSON.stringify(obj));
+}
 connect();
 
 // ── Message dispatch ──────────────────────────────────────────────────────────
@@ -1154,12 +1187,11 @@ function setBadge(id, live) {
   const el = document.getElementById(id);
   el.classList.toggle('live', live);
 }
-function setWsBadge(live) { setBadge('badge-ws', live); }
 
-// ── Sidebar actions ───────────────────────────────────────────────────────────
+// ── Sidebar actions (use data channel for non-motor commands) ─────────────
 document.getElementById('btn-reset-odom').onclick = () => send({ type: 'reset_odom' });
 document.getElementById('btn-clear-map').onclick  = () => { clearMapData(); send({ type: 'clear_map' }); };
-document.getElementById('btn-estop').onclick      = () => send({ type: 'stop' });
+document.getElementById('btn-estop').onclick      = () => sendStop();  // e-stop goes on fast cmd channel
 
 // ── Speed slider ──────────────────────────────────────────────────────────────
 const speedSlider = document.getElementById('speed-slider');
@@ -1173,9 +1205,9 @@ updateSliderCSS();
 
 const speed = () => parseInt(speedSlider.value);
 
-// ── Motor command helpers ──────────────────────────────────────────────────────
-function sendCmd(l, r) { send({ type: 'cmd', left: l, right: r }); }
-function sendStop()    { send({ type: 'stop' }); }
+// ── Motor command helpers (use dedicated cmd channel) ────────────────────
+function sendCmd(l, r) { cmdSend({ type: 'cmd', left: l, right: r }); }
+function sendStop()    { cmdSend({ type: 'stop' }); }
 
 // ── Key → command map ─────────────────────────────────────────────────────────
 const KEY_CMD = {
@@ -1261,17 +1293,18 @@ async def on_startup(app):
     threading.Thread(target=watchdog,      daemon=True).start()
     threading.Thread(target=lidar_reader,  daemon=True).start()
     asyncio.create_task(broadcaster(app))
-    print(f"\n{'='*54}")
+    print(f"\n{'='*56}")
     print(f"  Speleo-X Dashboard  →  http://<PI_IP>:{PORT}")
-    print(f"  STM32 serial : {', '.join(SERIAL_PORTS)}")
-    print(f"  LiDAR port   : {LIDAR_PORT}")
-    print(f"  SLAM map     : {MAP_SIZE_PIXELS}×{MAP_SIZE_PIXELS} px  /  {MAP_SIZE_METERS}m")
-    print(f"{'='*54}\n")
+    print(f"  Motor cmd channel  →  ws://<PI_IP>:{PORT}/ws/cmd")
+    print(f"  Data channel       →  ws://<PI_IP>:{PORT}/ws")
+    print(f"  SLAM map           : {MAP_SIZE_PIXELS}×{MAP_SIZE_PIXELS} px / {MAP_SIZE_METERS}m")
+    print(f"{'='*56}\n")
 
 
 app = web.Application()
-app.router.add_get("/",   index)
-app.router.add_get("/ws", ws_handler)
+app.router.add_get("/",      index)
+app.router.add_get("/ws",     ws_data_handler)   # data: telemetry + lidar + slam
+app.router.add_get("/ws/cmd", ws_cmd_handler)    # cmd:  motor commands only
 app.on_startup.append(on_startup)
 
 if __name__ == "__main__":
