@@ -34,7 +34,7 @@ from aiohttp import web
 # ── Configuration ─────────────────────────────────────────────────────────────
 HOST             = "0.0.0.0"
 PORT             = 5000
-SERIAL_PORTS     = ["/dev/bluepill", "/dev/ttyUSB0", "/dev/ttyACM0"]
+SERIAL_PORTS     = ["/dev/bluepill", "/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyUSB2", "/dev/ttyACM0", "/dev/ttyACM1"]
 BAUD_RATE        = 115200
 
 WHEEL_RADIUS     = 0.035
@@ -93,14 +93,16 @@ _last_slam_odom  = None        # (x_mm, y_mm, th_deg, time)
 
 def open_serial():
     for p in SERIAL_PORTS:
+        if p == LIDAR_PORT:
+            continue
         if os.path.exists(p):
             try:
                 s = serial.Serial(p, BAUD_RATE, timeout=0.1)
                 print(f"[serial] Opened {p} @ {BAUD_RATE}")
                 return s
             except serial.SerialException as e:
-                print(f"[serial] {p}: {e}")
-    print("[serial] No STM32 found — running in demo mode")
+                print(f"[serial] Could not open {p}: {e}")
+    print(f"[serial] No STM32 found on ports {[p for p in SERIAL_PORTS if p != LIDAR_PORT]} — running in demo mode")
     return None
 
 
