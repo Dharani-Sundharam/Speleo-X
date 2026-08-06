@@ -41,7 +41,7 @@ from aiohttp import web
 # ── Configuration ─────────────────────────────────────────────────────────────
 HOST            = "0.0.0.0"
 PORT            = 5000
-SERIAL_PORTS    = ["/dev/bluepill", "/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyACM0"]
+SERIAL_PORTS    = ["/dev/bluepill", "/dev/ttyUSB0", "/dev/ttyACM0"]
 BAUD_RATE       = 115200
 
 WHEEL_RADIUS    = 0.035
@@ -53,15 +53,29 @@ GYRO_SCALE      = 131.0
 GRAVITY         = 9.81
 
 WATCHDOG_SEC    = 1.0   # stop motors if browser goes silent
+
+# ── LiDAR settings (from ydlidar.yaml) ───────────────────────────────────────
+LIDAR_PORT        = "/dev/ttyUSB1"  # YDLiDAR on USB1
+LIDAR_BAUD        = 115200
+LIDAR_FREQ        = 10.0
+LIDAR_SAMPLE_RATE = 3
+LIDAR_SINGLE_CH   = True           # isSingleChannel: true
+LIDAR_REVERSION   = True
+LIDAR_INVERTED    = True
+LIDAR_MIN_RANGE   = 0.01           # metres
+LIDAR_MAX_RANGE   = 12.0           # metres
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Shared state
 _clients:   set   = set()
-_clients_lock     = None   # created inside on_startup (needs running event loop)
+_clients_lock     = None
 _serial_q         = queue.SimpleQueue()
+_lidar_queue      = queue.SimpleQueue()  # lidar scan batches
 _telemetry: dict  = {}
 _ser              = None
 _last_cmd_t       = time.time()
+_serial_status    = "demo"
+_parse_count      = 0
 
 # Odometry state
 _x = _y = _th = _vx = _wz = 0.0
@@ -100,19 +114,20 @@ def send_motor(left: int, right: int):
 # =============================================================================
 
 def serial_reader():
-    global _x, _y, _th, _vx, _wz, _prev_enc_l, _prev_enc_r, _prev_t, _telemetry
+    global _x, _y, _th, _vx, _wz, _prev_enc_l, _prev_enc_r, _prev_t
+    global _telemetry, _serial_status
 
     buf = b""
     while True:
         if _ser is None:
-            # Demo mode: generate fake telemetry
+            _serial_status = "demo"
             _telemetry = {
                 "t": int(time.time() * 1000),
                 "enc_l": 0, "enc_r": 0,
                 "ax": 0.0, "ay": 0.0, "az": GRAVITY,
                 "gx": 0.0, "gy": 0.0, "gz": 0.0,
                 "x": 0.0, "y": 0.0, "th": 0.0, "vx": 0.0,
-                "demo": True,
+                "serial": "demo",
             }
             time.sleep(0.05)
             continue
@@ -133,7 +148,8 @@ def serial_reader():
 
 
 def _parse_line(line: str):
-    global _x, _y, _th, _vx, _wz, _prev_enc_l, _prev_enc_r, _prev_t, _telemetry
+    global _x, _y, _th, _vx, _wz, _prev_enc_l, _prev_enc_r, _prev_t
+    global _telemetry, _serial_status, _parse_count
     try:
         fields = {}
         for tok in line.split():
@@ -142,7 +158,7 @@ def _parse_line(line: str):
                 fields[k] = int(v)
 
         if not {"ENC_L","ENC_R","AX","AY","AZ","GX","GY","GZ"}.issubset(fields):
-            return
+            return   # not a telemetry line (could be motion log etc.)
 
         enc_l = fields["ENC_L"]
         enc_r = fields["ENC_R"]
@@ -168,6 +184,19 @@ def _parse_line(line: str):
 
         _prev_enc_l, _prev_enc_r, _prev_t = enc_l, enc_r, now
 
+        # Update serial status on first successful parse
+        if _serial_status != "live":
+            _serial_status = "live"
+            print(f"[serial] ✓ First valid telemetry — ENC_L={enc_l} ENC_R={enc_r} AZ={az:.2f}m/s²")
+
+        # Debug: print every 50th line so you can confirm data in the terminal
+        _parse_count += 1
+        if _parse_count % 50 == 0:
+            print(f"[telem]  ENC_L={enc_l:6d}  ENC_R={enc_r:6d} "
+                  f"| AX={ax:6.2f} AY={ay:6.2f} AZ={az:6.2f} "
+                  f"| GZ={gz:7.4f} "
+                  f"| X={_x:.3f}m Y={_y:.3f}m TH={math.degrees(_th):.1f}°")
+
         _telemetry = {
             "t": fields.get("T", 0),
             "enc_l": enc_l, "enc_r": enc_r,
@@ -176,9 +205,10 @@ def _parse_line(line: str):
             "x": round(_x, 4), "y": round(_y, 4),
             "th": round(math.degrees(_th), 1),
             "vx": round(_vx, 4),
+            "serial": "live",
         }
     except Exception as e:
-        pass
+        print(f"[parse] error on '{line[:60]}': {e}")
 
 
 # =============================================================================
@@ -196,24 +226,107 @@ def watchdog():
 
 
 # =============================================================================
-# Broadcast telemetry to all WebSocket clients  (~20 Hz)
+# LiDAR reader thread — YDLiDAR SDK
+# =============================================================================
+
+def lidar_reader():
+    """Read YDLiDAR scans and push point arrays into _lidar_queue."""
+    try:
+        import ydlidar
+    except ImportError:
+        print("[lidar] ydlidar SDK not installed — LiDAR disabled.")
+        print("[lidar] Install: pip3 install ydlidar --break-system-packages")
+        return
+
+    ydlidar.os_init()
+    laser = ydlidar.CYdLidar()
+
+    # Apply settings from ydlidar.yaml
+    laser.setlidaropt(ydlidar.LidarPropSerialPort,         LIDAR_PORT)
+    laser.setlidaropt(ydlidar.LidarPropSerialBaudrate,     LIDAR_BAUD)
+    laser.setlidaropt(ydlidar.LidarPropLidarType,          ydlidar.TYPE_TRIANGLE)
+    laser.setlidaropt(ydlidar.LidarPropDeviceType,         ydlidar.YDLIDAR_TYPE_SERIAL)
+    laser.setlidaropt(ydlidar.LidarPropScanFrequency,      LIDAR_FREQ)
+    laser.setlidaropt(ydlidar.LidarPropSampleRate,         LIDAR_SAMPLE_RATE)
+    laser.setlidaropt(ydlidar.LidarPropSingleChannel,      LIDAR_SINGLE_CH)
+    laser.setlidaropt(ydlidar.LidarPropReversion,          LIDAR_REVERSION)
+    laser.setlidaropt(ydlidar.LidarPropInverted,           LIDAR_INVERTED)
+    laser.setlidaropt(ydlidar.LidarPropMaxAngle,           180.0)
+    laser.setlidaropt(ydlidar.LidarPropMinAngle,          -180.0)
+    laser.setlidaropt(ydlidar.LidarPropMaxRange,           LIDAR_MAX_RANGE)
+    laser.setlidaropt(ydlidar.LidarPropMinRange,           LIDAR_MIN_RANGE)
+    laser.setlidaropt(ydlidar.LidarPropSupportMotorDtrCtrl, True)
+    laser.setlidaropt(ydlidar.LidarPropAutoReconnect,      True)
+
+    if not laser.initialize():
+        print(f"[lidar] Failed to initialize on {LIDAR_PORT}")
+        return
+
+    if not laser.turnOn():
+        print("[lidar] Failed to start scanning")
+        laser.disconnecting()
+        return
+
+    print(f"[lidar] ✓ YDLiDAR running on {LIDAR_PORT} @ {LIDAR_FREQ}Hz")
+    scan = ydlidar.LaserScan()
+
+    while ydlidar.os_isOk():
+        r = laser.doProcessSimple(scan)
+        if r and scan.points:
+            points = []
+            for p in scan.points:
+                dist_m = p.range
+                if LIDAR_MIN_RANGE < dist_m < LIDAR_MAX_RANGE:
+                    angle_deg = round(math.degrees(p.angle), 1)
+                    dist_mm   = round(dist_m * 1000, 0)
+                    points.append([angle_deg, dist_mm])
+            if points:
+                _lidar_queue.put_nowait(points)
+
+    laser.turnOff()
+    laser.disconnecting()
+    print("[lidar] Stopped")
+
+
+# =============================================================================
+# Broadcast telemetry + lidar to all WebSocket clients  (~20 Hz)
 # =============================================================================
 
 async def broadcaster(app):
     global _clients
     while True:
         await asyncio.sleep(0.05)
-        if not _telemetry:
-            continue
-        msg = json.dumps({"type": "telemetry", **_telemetry})
-        async with _clients_lock:
-            dead = set()
-            for ws in _clients:
-                try:
-                    await ws.send_str(msg)
-                except Exception:
-                    dead.add(ws)
-            _clients -= dead
+
+        # ── Telemetry ──────────────────────────────────────────────────────────
+        if _telemetry:
+            msg = json.dumps({"type": "telemetry", **_telemetry})
+            async with _clients_lock:
+                dead = set()
+                for ws in _clients:
+                    try:
+                        await ws.send_str(msg)
+                    except Exception:
+                        dead.add(ws)
+                _clients -= dead
+
+        # ── LiDAR (drain all pending scans, only send latest) ──────────────────
+        latest_scan = None
+        while True:
+            try:
+                latest_scan = _lidar_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        if latest_scan is not None:
+            lidar_msg = json.dumps({"type": "lidar", "points": latest_scan})
+            async with _clients_lock:
+                dead = set()
+                for ws in _clients:
+                    try:
+                        await ws.send_str(lidar_msg)
+                    except Exception:
+                        dead.add(ws)
+                _clients -= dead
 
 
 # =============================================================================
@@ -750,13 +863,15 @@ async def index(request):
 
 async def on_startup(app):
     global _ser, _clients_lock
-    _clients_lock = asyncio.Lock()   # create inside running event loop
+    _clients_lock = asyncio.Lock()
     _ser = open_serial()
     threading.Thread(target=serial_reader, daemon=True).start()
     threading.Thread(target=watchdog,      daemon=True).start()
+    threading.Thread(target=lidar_reader,  daemon=True).start()
     asyncio.create_task(broadcaster(app))
     print(f"\n{'='*50}")
     print(f"  Speleo-X Dashboard  →  http://<PI_IP>:{PORT}")
+    print(f"  LiDAR port: {LIDAR_PORT}")
     print(f"{'='*50}\n")
 
 
