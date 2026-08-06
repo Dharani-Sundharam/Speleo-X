@@ -43,6 +43,9 @@ TICKS_PER_REV_L  = 725
 TICKS_PER_REV_R  = 711
 INVERT_ENC_L     = True    # True if left encoder decreases when driving forward
 INVERT_ENC_R     = False   # True if right encoder decreases when driving forward
+MOTOR_L_INVERT   = False   # Set True if left motor runs in reverse
+MOTOR_R_INVERT   = False   # Set True if right motor runs in reverse
+MOTOR_SWAP_LR    = False   # Set True if left/right motor channels are swapped
 ACCEL_SCALE      = 16384.0
 GYRO_SCALE       = 131.0
 GRAVITY          = 9.81
@@ -59,6 +62,7 @@ LIDAR_MIN_RANGE  = 0.01    # metres
 LIDAR_MAX_RANGE  = 12.0    # metres
 LIDAR_SCAN_SIZE  = 280     # "Single Fixed Size: 280" from SDK output
 LIDAR_ANGLE_OFFSET_DEG = 180.0  # rotate LiDAR frame to match robot forward direction
+LIDAR_INVERT_ANGLE     = False  # Invert scan rotation direction if CW
                                   # (0=no rotation; adjust if obstacles appear backwards)
 
 MAP_SIZE_PIXELS  = 256
@@ -111,6 +115,12 @@ def open_serial():
 def send_motor(left: int, right: int):
     global _last_cmd_t
     _last_cmd_t = time.time()
+    if MOTOR_SWAP_LR:
+        left, right = right, left
+    if MOTOR_L_INVERT:
+        left = -left
+    if MOTOR_R_INVERT:
+        right = -right
     if _ser:
         try:
             _ser.write(f"m,{left},{right}\n".encode())
@@ -474,9 +484,8 @@ async def broadcaster(app):
 # =============================================================================
 
 async def ws_cmd_handler(request):
-    """High-priority WebSocket for motor commands only.
-    Nothing is ever sent back on this channel — no telemetry, no lidar,
-    no lock waits from the broadcaster. Latency is as low as WiFi allows."""
+    """High-priority WebSocket for motor commands and real-time config."""
+    global MOTOR_L_INVERT, MOTOR_R_INVERT, MOTOR_SWAP_LR
     ws = web.WebSocketResponse(heartbeat=2.0)
     await ws.prepare(request)
     print(f"[cmd] {request.remote} connected")
@@ -492,6 +501,11 @@ async def ws_cmd_handler(request):
                         send_motor(l, r)
                     elif t == "stop":
                         send_motor(0, 0)
+                    elif t == "set_motor_config":
+                        if "invert_l" in d: MOTOR_L_INVERT = bool(d["invert_l"])
+                        if "invert_r" in d: MOTOR_R_INVERT = bool(d["invert_r"])
+                        if "swap_lr"  in d: MOTOR_SWAP_LR  = bool(d["swap_lr"])
+                        print(f"[motor] Config updated: Invert_L={MOTOR_L_INVERT} Invert_R={MOTOR_R_INVERT} Swap_LR={MOTOR_SWAP_LR}")
                 except Exception:
                     pass
     finally:
@@ -822,6 +836,14 @@ input[type=range]::-webkit-slider-thumb {
       </div>
 
       <div class="section">
+        <div class="section-title">Motor Calibration</div>
+        <div class="trow"><label style="font-size:12px; cursor:pointer;"><input type="checkbox" id="chk-invert-l"> Invert Left Motor</label></div>
+        <div class="trow"><label style="font-size:12px; cursor:pointer;"><input type="checkbox" id="chk-invert-r"> Invert Right Motor</label></div>
+        <div class="trow"><label style="font-size:12px; cursor:pointer;"><input type="checkbox" id="chk-swap-lr"> Swap L / R</label></div>
+        <div class="trow"><label style="font-size:12px; cursor:pointer;"><input type="checkbox" id="chk-accumulate"> Persistent Map</label></div>
+      </div>
+
+      <div class="section">
         <div class="section-title">Actions</div>
         <button class="sidebar-btn" id="btn-reset-odom">Reset Odometry</button>
         <button class="sidebar-btn" id="btn-clear-map">Clear Map</button>
@@ -967,30 +989,34 @@ function onTelemetry(d) {
   }
 }
 
+let liveScanPts = [];
+let accumulateMap = false;
+
 function onLidar(d) {
-  // d.points = [[angle_deg, dist_mm], ...]
-  // d.rx, d.ry = robot world position at scan time (metres)
-  // d.rth      = robot heading (degrees) at scan time
-  // d.angle_offset = LiDAR-to-robot frame rotation (degrees)
   const rx   = d.rx,  ry  = d.ry;
   const rthR = d.rth * Math.PI / 180;
   const cosR = Math.cos(rthR), sinR = Math.sin(rthR);
   const offR = (d.angle_offset || 0) * Math.PI / 180;
 
+  const currentScan = [];
   for (const [angleDeg, distMm] of d.points) {
     const distM  = distMm / 1000;
-    const aR     = angleDeg * Math.PI / 180 + offR;  // apply lidar frame offset
-    // Local lidar frame → world frame (rotate by robot heading)
+    if (distM < 0.05 || distM > 12.0) continue;
+    const aR     = angleDeg * Math.PI / 180 + offR;
     const lx = distM * Math.cos(aR);
     const ly = distM * Math.sin(aR);
     const wx = rx + cosR * lx - sinR * ly;
     const wy = ry + sinR * lx + cosR * ly;
-    // Bin to grid
-    const gx  = Math.round(wx / GRID_RES);
-    const gy  = Math.round(wy / GRID_RES);
-    const key = `${gx},${gy}`;
-    obstacles.set(key, Math.min(20, (obstacles.get(key) || 0) + 1));
+    currentScan.push({wx, wy, distM});
+
+    if (accumulateMap) {
+      const gx  = Math.round(wx / GRID_RES);
+      const gy  = Math.round(wy / GRID_RES);
+      const key = `${gx},${gy}`;
+      obstacles.set(key, Math.min(20, (obstacles.get(key) || 0) + 1));
+    }
   }
+  liveScanPts = currentScan;
 }
 
 function onSlam(d) {
@@ -1044,8 +1070,11 @@ function render() {
   // ── SLAM map (if available) ────────────────────────────────────────────────
   if (slamMap && slamMeta) drawSlamMap();
 
-  // ── Obstacle points ────────────────────────────────────────────────────────
-  drawObstacles();
+  // ── Persistent obstacle points (if enabled) ────────────────────────────────
+  if (accumulateMap) drawObstacles();
+
+  // ── Live real-time LiDAR scan (crisp, zero smearing) ───────────────────────
+  drawLiveLidar();
 
   // ── Path trail ─────────────────────────────────────────────────────────────
   if (pathPts.length > 1) {
@@ -1132,9 +1161,38 @@ function drawSlamMap() {
   ctx.restore();
 }
 
+function drawLiveLidar() {
+  if (!liveScanPts || liveScanPts.length === 0) return;
+  const [robCx, robCy] = w2c(robotX, robotY);
+
+  ctx.save();
+  // 1. Faint laser beams
+  ctx.beginPath();
+  for (const p of liveScanPts) {
+    const [cx, cy] = w2c(p.wx, p.wy);
+    ctx.moveTo(robCx, robCy);
+    ctx.lineTo(cx, cy);
+  }
+  ctx.strokeStyle = 'rgba(0, 122, 255, 0.04)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // 2. Crisp laser impact points
+  for (const p of liveScanPts) {
+    const [cx, cy] = w2c(p.wx, p.wy);
+    if (cx < -10 || cx > canvas.width + 10 || cy < -10 || cy > canvas.height + 10) continue;
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, 2.5, 0, Math.PI * 2);
+    ctx.fillStyle = '#007AFF';
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
 function drawObstacles() {
   const pxSize = Math.max(2, GRID_RES * mapScale * 0.9);
-  ctx.fillStyle = 'rgba(28,28,30,0.75)';
+  ctx.fillStyle = 'rgba(28,28,30,0.50)';
   for (const key of obstacles.keys()) {
     const [gx, gy] = key.split(',').map(Number);
     const wx = gx * GRID_RES, wy = gy * GRID_RES;
@@ -1207,9 +1265,28 @@ function setBadge(id, live) {
   el.classList.toggle('live', live);
 }
 
+// ── Motor configuration UI handlers ───────────────────────────────────────
+const chkInvL = document.getElementById('chk-invert-l');
+const chkInvR = document.getElementById('chk-invert-r');
+const chkSwap = document.getElementById('chk-swap-lr');
+const chkAcc  = document.getElementById('chk-accumulate');
+
+function updateMotorConfig() {
+  cmdSend({
+    type: 'set_motor_config',
+    invert_l: chkInvL.checked,
+    invert_r: chkInvR.checked,
+    swap_lr:  chkSwap.checked
+  });
+}
+chkInvL.onchange = updateMotorConfig;
+chkInvR.onchange = updateMotorConfig;
+chkSwap.onchange = updateMotorConfig;
+chkAcc.onchange  = () => { accumulateMap = chkAcc.checked; if (!accumulateMap) obstacles.clear(); };
+
 // ── Sidebar actions (use data channel for non-motor commands) ─────────────
 document.getElementById('btn-reset-odom').onclick = () => send({ type: 'reset_odom' });
-document.getElementById('btn-clear-map').onclick  = () => { clearMapData(); send({ type: 'clear_map' }); };
+document.getElementById('btn-clear-map').onclick  = () => { clearMapData(); liveScanPts = []; send({ type: 'clear_map' }); };
 document.getElementById('btn-estop').onclick      = () => sendStop();  // e-stop goes on fast cmd channel
 
 // ── Speed slider ──────────────────────────────────────────────────────────────
