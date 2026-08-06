@@ -671,21 +671,48 @@ const KEY_MAP = {
   's': () => sendCmd(-speed(), -speed()),
   'a': () => sendCmd(-speed(),  speed()),
   'd': () => sendCmd( speed(), -speed()),
-  ' ': ()  => sendStop(),
+  ' ': () => sendStop(),
 };
 const STOP_ON_RELEASE = new Set(['w','s','a','d']);
+
+// ── Continuous hold: re-send command every 250ms while key held ────────────
+let _cmdInterval = null;
+let _activeCmd   = null;
+
+function startHold(key) {
+  if (_activeCmd === key) return;          // already holding this key
+  stopHold();                              // cancel any previous hold
+  _activeCmd = key;
+  if (KEY_MAP[key]) {
+    KEY_MAP[key]();                        // send immediately
+    if (key !== ' ') {
+      _cmdInterval = setInterval(() => {
+        if (KEY_MAP[_activeCmd]) KEY_MAP[_activeCmd]();
+      }, 250);                             // re-send every 250ms (watchdog=1s)
+    }
+  }
+  highlightBtn(key, true);
+}
+
+function stopHold(key) {
+  if (key && key !== _activeCmd) return;  // ignore if different key
+  clearInterval(_cmdInterval);
+  _cmdInterval = null;
+  if (_activeCmd && STOP_ON_RELEASE.has(_activeCmd)) sendStop();
+  highlightBtn(_activeCmd, false);
+  _activeCmd = null;
+}
 
 const held = new Set();
 document.addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
-  if (KEY_MAP[k] && !held.has(k)) { held.add(k); KEY_MAP[k](); highlightBtn(k, true); }
-  if (k === ' ') e.preventDefault();
+  if (KEY_MAP[k] && !held.has(k)) { held.add(k); startHold(k); }
+  if (k === ' ') { e.preventDefault(); sendStop(); }
 });
 document.addEventListener('keyup', e => {
   const k = e.key.toLowerCase();
-  if (STOP_ON_RELEASE.has(k) && held.has(k)) sendStop();
   held.delete(k);
-  highlightBtn(k, false);
+  stopHold(k);
 });
 
 function highlightBtn(key, on) {
@@ -694,19 +721,16 @@ function highlightBtn(key, on) {
   });
 }
 
-// On-screen buttons
+// On-screen buttons — same interval pattern
 document.querySelectorAll('.btn').forEach(btn => {
   const key = btn.dataset.key;
-
-  const press   = () => { if (KEY_MAP[key]) { held.add(key); KEY_MAP[key](); btn.classList.add('pressed'); } };
-  const release = () => { if (STOP_ON_RELEASE.has(key)) sendStop(); held.delete(key); btn.classList.remove('pressed'); };
-
-  btn.addEventListener('mousedown',  press);
-  btn.addEventListener('touchstart', e => { e.preventDefault(); press(); }, {passive:false});
-  btn.addEventListener('mouseup',    release);
-  btn.addEventListener('touchend',   release);
-  btn.addEventListener('mouseleave', release);
+  btn.addEventListener('mousedown',  ()  => startHold(key));
+  btn.addEventListener('touchstart', e  => { e.preventDefault(); startHold(key); }, {passive:false});
+  btn.addEventListener('mouseup',    ()  => stopHold(key));
+  btn.addEventListener('touchend',   ()  => stopHold(key));
+  btn.addEventListener('mouseleave', ()  => stopHold(key));
 });
+
 </script>
 </body>
 </html>"""
