@@ -40,7 +40,7 @@ from aiohttp import web
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 HOST            = "0.0.0.0"
-PORT            = 8080
+PORT            = 5000
 SERIAL_PORTS    = ["/dev/bluepill", "/dev/ttyUSB0", "/dev/ttyUSB1", "/dev/ttyACM0"]
 BAUD_RATE       = 115200
 
