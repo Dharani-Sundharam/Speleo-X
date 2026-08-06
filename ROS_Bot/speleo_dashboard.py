@@ -410,6 +410,7 @@ def lidar_reader():
 
 async def _broadcast(msg_str: str):
     """Send a message to all clients; yield between each send to keep loop responsive."""
+    global _clients
     async with _clients_lock:
         dead = set()
         for ws in _clients:
