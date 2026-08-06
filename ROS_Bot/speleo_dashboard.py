@@ -432,22 +432,34 @@ async def broadcaster(app):
             msg = json.dumps({"type": "telemetry", **_telemetry,
                               "serial": _serial_status,
                               "lidar":  _lidar_status})
-                _clients -= dead
+            await _broadcast(msg)
 
-        # ── SLAM map (every ~2s = 40 ticks) ───────────────────────────────
-        if tick % 40 == 0:
+        # ── LiDAR scan points (every 2nd tick = 10 Hz) ──────────────────────
+        if tick % 2 == 0:
+            latest_scan = None
+            while True:
+                try:    latest_scan = _lidar_queue.get_nowait()
+                except queue.Empty: break
+            if latest_scan is not None:
+                step = max(1, len(latest_scan) // 120)
+                pts  = latest_scan[::step]
+                lmsg = json.dumps({"type": "lidar",
+                                   "points": pts,
+                                   "rx":    round(_x, 4),
+                                   "ry":    round(_y, 4),
+                                   "rth":   round(math.degrees(_th), 2),
+                                   "angle_offset": LIDAR_ANGLE_OFFSET_DEG})
+                await _broadcast(lmsg)
+
+        # ── SLAM map (every 100 ticks = 5 s) ──────────────────────────────
+        if tick % 100 == 0:
             latest_map = None
             while True:
                 try:    latest_map = _map_queue.get_nowait()
                 except queue.Empty: break
             if latest_map is not None:
                 mmsg = json.dumps(latest_map)
-                async with _clients_lock:
-                    dead = set()
-                    for ws in _clients:
-                        try:    await ws.send_str(mmsg)
-                        except: dead.add(ws)
-                    _clients -= dead
+                await _broadcast(mmsg)
 
 
 # =============================================================================
