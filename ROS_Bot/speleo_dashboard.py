@@ -271,8 +271,12 @@ def _preprocess_scan(points):
     return scan
 
 
+# How to call slam.update() — probed once on first scan
+_slam_update_mode = None   # None=unknown, 'kw'=velocities kwarg, 'pos'=positional, 'bare'=no vel
+
+
 def _slam_update(points):
-    global _slam_obj, _slam_pose, _last_slam_odom
+    global _slam_obj, _slam_pose, _last_slam_odom, _slam_update_mode
 
     if _slam_obj is None:
         _init_slam()
@@ -301,7 +305,27 @@ def _slam_update(points):
 
     with _slam_lock:
         try:
-            _slam_obj.update(scan_mm, velocities=vel)
+            # ── Probe call signature once ───────────────────────────────────
+            if _slam_update_mode is None:
+                for mode in ('kw', 'pos', 'bare'):
+                    try:
+                        if mode == 'kw'  and vel: _slam_obj.update(scan_mm, velocities=vel)
+                        elif mode == 'pos' and vel: _slam_obj.update(scan_mm, vel)
+                        else:                       _slam_obj.update(scan_mm)
+                        _slam_update_mode = mode
+                        print(f"[slam] update() API mode: '{mode}'")
+                        break
+                    except TypeError:
+                        continue
+                if _slam_update_mode is None:
+                    _slam_update_mode = 'bare'
+                    print("[slam] Falling back to bare update (no velocities)")
+            else:
+                # ── Normal call using known mode ────────────────────────────
+                if _slam_update_mode == 'kw'  and vel: _slam_obj.update(scan_mm, velocities=vel)
+                elif _slam_update_mode == 'pos' and vel: _slam_obj.update(scan_mm, vel)
+                else:                                    _slam_obj.update(scan_mm)
+
             sx, sy, sth = _slam_obj.getpos()
             _slam_pose   = [sx, sy, sth]
             mapbytes     = bytearray(MAP_SIZE_PIXELS * MAP_SIZE_PIXELS)
@@ -315,7 +339,7 @@ def _slam_update(points):
                 "robot":  [round(sx, 1), round(sy, 1), round(sth, 2)],
             })
         except Exception as e:
-            print(f"[slam] update error: {e}")
+            print(f"[slam] error: {e}")
 
 
 # =============================================================================
