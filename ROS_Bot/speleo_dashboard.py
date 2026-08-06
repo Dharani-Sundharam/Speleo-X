@@ -236,7 +236,7 @@ def watchdog():
 # =============================================================================
 
 def _init_slam():
-    global _slam_obj
+    global _slam_obj, _slam_update_mode
     try:
         from breezyslam.algorithms import RMHC_SLAM
         from breezyslam.sensors import Laser
@@ -249,10 +249,27 @@ def _init_slam():
             offset_mm=0,
         )
         _slam_obj = RMHC_SLAM(laser, MAP_SIZE_PIXELS, MAP_SIZE_METERS, random_seed=42)
-        print(f"[slam] ✓ BreezySlam initialized  ({MAP_SIZE_PIXELS}×{MAP_SIZE_PIXELS} @ {MAP_SIZE_METERS}m)")
+        print(f"[slam] ✓ BreezySlam initialized  ({MAP_SIZE_PIXELS}x{MAP_SIZE_PIXELS} @ {MAP_SIZE_METERS}m)")
+
+        # ── Probe update() signature with a real dummy velocity tuple ─────────────────
+        dummy_scan = [int(LIDAR_MAX_RANGE * 1000)] * LIDAR_SCAN_SIZE
+        dummy_vel  = (0.0, 0.0, 0.1)
+        for mode in ('kw', 'pos', 'bare'):
+            try:
+                if   mode == 'kw':  _slam_obj.update(dummy_scan, velocities=dummy_vel)
+                elif mode == 'pos': _slam_obj.update(dummy_scan, dummy_vel)
+                else:               _slam_obj.update(dummy_scan)
+                _slam_update_mode = mode
+                print(f"[slam] update() API mode detected: '{mode}'")
+                break
+            except TypeError:
+                continue
+        else:
+            _slam_update_mode = 'bare'
+            print("[slam] update() bare mode (no odometry velocities)")
+
     except ImportError:
         print("[slam] BreezySlam not installed — using raw LiDAR overlay")
-        print("[slam] Install: pip3 install breezyslam --break-system-packages")
         _slam_obj = False
 
 
@@ -271,12 +288,12 @@ def _preprocess_scan(points):
     return scan
 
 
-# How to call slam.update() — probed once on first scan
-_slam_update_mode = None   # None=unknown, 'kw'=velocities kwarg, 'pos'=positional, 'bare'=no vel
+# ── update() call mode — detected in _init_slam() ────────────────────────────
+_slam_update_mode = 'bare'
 
 
 def _slam_update(points):
-    global _slam_obj, _slam_pose, _last_slam_odom, _slam_update_mode
+    global _slam_obj, _slam_pose, _last_slam_odom
 
     if _slam_obj is None:
         _init_slam()
@@ -305,26 +322,10 @@ def _slam_update(points):
 
     with _slam_lock:
         try:
-            # ── Probe call signature once ───────────────────────────────────
-            if _slam_update_mode is None:
-                for mode in ('kw', 'pos', 'bare'):
-                    try:
-                        if mode == 'kw'  and vel: _slam_obj.update(scan_mm, velocities=vel)
-                        elif mode == 'pos' and vel: _slam_obj.update(scan_mm, vel)
-                        else:                       _slam_obj.update(scan_mm)
-                        _slam_update_mode = mode
-                        print(f"[slam] update() API mode: '{mode}'")
-                        break
-                    except TypeError:
-                        continue
-                if _slam_update_mode is None:
-                    _slam_update_mode = 'bare'
-                    print("[slam] Falling back to bare update (no velocities)")
-            else:
-                # ── Normal call using known mode ────────────────────────────
-                if _slam_update_mode == 'kw'  and vel: _slam_obj.update(scan_mm, velocities=vel)
-                elif _slam_update_mode == 'pos' and vel: _slam_obj.update(scan_mm, vel)
-                else:                                    _slam_obj.update(scan_mm)
+            # Call update with the API mode detected at init time
+            if   _slam_update_mode == 'kw'  and vel is not None: _slam_obj.update(scan_mm, velocities=vel)
+            elif _slam_update_mode == 'pos' and vel is not None: _slam_obj.update(scan_mm, vel)
+            else:                                                 _slam_obj.update(scan_mm)
 
             sx, sy, sth = _slam_obj.getpos()
             _slam_pose   = [sx, sy, sth]
