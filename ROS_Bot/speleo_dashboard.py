@@ -57,8 +57,8 @@ WATCHDOG_SEC    = 1.0   # stop motors if browser goes silent
 
 # Shared state
 _clients:   set   = set()
-_clients_lock     = asyncio.Lock()
-_serial_q         = queue.SimpleQueue()   # (left_pwm, right_pwm) from browser
+_clients_lock     = None   # created inside on_startup (needs running event loop)
+_serial_q         = queue.SimpleQueue()
 _telemetry: dict  = {}
 _ser              = None
 _last_cmd_t       = time.time()
@@ -200,6 +200,7 @@ def watchdog():
 # =============================================================================
 
 async def broadcaster(app):
+    global _clients
     while True:
         await asyncio.sleep(0.05)
         if not _telemetry:
@@ -220,6 +221,7 @@ async def broadcaster(app):
 # =============================================================================
 
 async def ws_handler(request):
+    global _clients
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     async with _clients_lock:
@@ -723,7 +725,8 @@ async def index(request):
 # =============================================================================
 
 async def on_startup(app):
-    global _ser
+    global _ser, _clients_lock
+    _clients_lock = asyncio.Lock()   # create inside running event loop
     _ser = open_serial()
     threading.Thread(target=serial_reader, daemon=True).start()
     threading.Thread(target=watchdog,      daemon=True).start()
