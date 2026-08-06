@@ -55,10 +55,12 @@ LIDAR_REVERSION  = True
 LIDAR_INVERTED   = True
 LIDAR_MIN_RANGE  = 0.01    # metres
 LIDAR_MAX_RANGE  = 12.0    # metres
-LIDAR_SCAN_SIZE  = 270     # "Single Fixed Size: 270" from SDK
+LIDAR_SCAN_SIZE  = 280     # "Single Fixed Size: 280" from SDK output
+LIDAR_ANGLE_OFFSET_DEG = 180.0  # rotate LiDAR frame to match robot forward direction
+                                  # (0=no rotation; adjust if obstacles appear backwards)
 
 MAP_SIZE_PIXELS  = 512
-MAP_SIZE_METERS  = 25.0    # 25m × 25m coverage area
+MAP_SIZE_METERS  = 25.0
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Shared state ──────────────────────────────────────────────────────────────
@@ -435,7 +437,8 @@ async def broadcaster(app):
                                "points": latest_scan,
                                "rx": round(_x, 4),
                                "ry": round(_y, 4),
-                               "rth": round(math.degrees(_th), 2)})
+                               "rth": round(math.degrees(_th), 2),
+                               "angle_offset": LIDAR_ANGLE_OFFSET_DEG})
             async with _clients_lock:
                 dead = set()
                 for ws in _clients:
@@ -915,15 +918,17 @@ function onTelemetry(d) {
 function onLidar(d) {
   // d.points = [[angle_deg, dist_mm], ...]
   // d.rx, d.ry = robot world position at scan time (metres)
-  // d.rth = robot heading (degrees) at scan time
+  // d.rth      = robot heading (degrees) at scan time
+  // d.angle_offset = LiDAR-to-robot frame rotation (degrees)
   const rx   = d.rx,  ry  = d.ry;
   const rthR = d.rth * Math.PI / 180;
   const cosR = Math.cos(rthR), sinR = Math.sin(rthR);
+  const offR = (d.angle_offset || 0) * Math.PI / 180;
 
   for (const [angleDeg, distMm] of d.points) {
     const distM  = distMm / 1000;
-    const aR     = angleDeg * Math.PI / 180;
-    // Local lidar frame → world frame
+    const aR     = angleDeg * Math.PI / 180 + offR;  // apply lidar frame offset
+    // Local lidar frame → world frame (rotate by robot heading)
     const lx = distM * Math.cos(aR);
     const ly = distM * Math.sin(aR);
     const wx = rx + cosR * lx - sinR * ly;
@@ -1045,29 +1050,31 @@ function drawSlamMap() {
   const img = offCtx.createImageData(size, size);
   for (let i = 0; i < size * size; i++) {
     const v = slamMap[i];
-    // breezyslam: 0=unknown, up to 127=free
+    // breezyslam: 0=unknown, up to 127=free space
     let r, g, b;
-    if (v === 0)      { r = g = b = 210; }   // unknown — mid gray
-    else              { const t = v / 127; r = g = b = Math.round(210 + t * 45); } // free — white
+    if (v === 0) { r = g = b = 210; }            // unknown — mid gray
+    else { const t = v/127; r=g=b=Math.round(210+t*45); }  // free — white
     img.data[i*4]=r; img.data[i*4+1]=g; img.data[i*4+2]=b; img.data[i*4+3]=255;
   }
   offCtx.putImageData(img, 0, 0);
 
   // SLAM robot pos → map pixel
-  const mmPerPx   = meters * 1000 / size;
-  const slamPx    = size / 2 + rx_mm / mmPerPx;
-  const slamPy    = size / 2 - ry_mm / mmPerPx;  // Y flipped for screen
+  // getpos() returns ABSOLUTE mm from map bottom-left corner.
+  // Robot starts at map center = (MAP_SIZE_METERS/2*1000, MAP_SIZE_METERS/2*1000) mm
+  const mmPerPx = meters * 1000 / size;
+  const slamPx  = rx_mm / mmPerPx;          // absolute map pixel X
+  const slamPy  = size - ry_mm / mmPerPx;   // Y flipped (screen Y goes down)
 
-  // Scale: canvas px per map pixel
+  // Scale: canvas pixels per map pixel
   const s = mapScale * meters / size;
 
-  // Robot is at canvas center; SLAM map pixel slamPx/slamPy corresponds to robot world pos
+  // Draw map so that slamPx/slamPy lands exactly on the robot canvas position
   const [robCx, robCy] = w2c(robotX, robotY);
   const drawX = robCx - slamPx * s;
   const drawY = robCy - slamPy * s;
 
   ctx.save();
-  ctx.globalAlpha = 0.65;
+  ctx.globalAlpha = 0.70;
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(offC, drawX, drawY, size * s, size * s);
   ctx.restore();
