@@ -41,6 +41,8 @@ WHEEL_RADIUS     = 0.035
 WHEEL_BASE       = 0.20
 TICKS_PER_REV_L  = 725
 TICKS_PER_REV_R  = 711
+INVERT_ENC_L     = True    # True if left encoder decreases when driving forward
+INVERT_ENC_R     = False   # True if right encoder decreases when driving forward
 ACCEL_SCALE      = 16384.0
 GYRO_SCALE       = 131.0
 GRAVITY          = 9.81
@@ -180,8 +182,10 @@ def _parse_line(line: str):
 
         now = time.time()
         if _prev_enc_l is not None and _prev_t is not None:
-            dl = (enc_l - _prev_enc_l) / TICKS_PER_REV_L * 2 * math.pi * WHEEL_RADIUS
-            dr = (enc_r - _prev_enc_r) / TICKS_PER_REV_R * 2 * math.pi * WHEEL_RADIUS
+            delta_l = (enc_l - _prev_enc_l) * (-1 if INVERT_ENC_L else 1)
+            delta_r = (enc_r - _prev_enc_r) * (-1 if INVERT_ENC_R else 1)
+            dl = delta_l / TICKS_PER_REV_L * 2 * math.pi * WHEEL_RADIUS
+            dr = delta_r / TICKS_PER_REV_R * 2 * math.pi * WHEEL_RADIUS
             dc = (dl + dr) / 2.0
             dth = (dr - dl) / WHEEL_BASE
             _th = math.atan2(math.sin(_th + dth), math.cos(_th + dth))
@@ -1142,7 +1146,7 @@ function drawObstacles() {
 
 function drawRobot() {
   const [cx, cy] = w2c(robotX, robotY);
-  const angle = (robotTh - 90) * Math.PI / 180;  // screen: 0° = up
+  const angle = (90 - robotTh) * Math.PI / 180;  // 0° = East (Right), 90° = North (Up)
   const sz = 14;
 
   ctx.save();
